@@ -1,4 +1,4 @@
--- Violation District / SmugLib V2 / 2026-11-09.5
+-- Violation District / SmugLib V2 / 2026-11-09.6
 -- Executor client. All active features start disabled. See README.md for controls and feature scope.
 local source = game:HttpGet("https://raw.githubusercontent.com/Xa3ro5/LifeIsRoblox/refs/heads/main/SmugLibCoreV2.lua")
 local factory, compileError = loadstring(source, "SmugLibCoreV2")
@@ -19,7 +19,7 @@ local env = getgenv()
 if env.SmugVD and type(env.SmugVD.Unload) == "function" then env.SmugVD:Unload() end
 assert(game.GameId == 6739698191, "This adapter is intended for Violation District.")
 
-local A = {alive=true, version="2026-11-09.5", connections={}, changes={}, entries={}, failures={},
+local A = {alive=true, version="2026-11-09.6", connections={}, changes={}, entries={}, failures={},
     generation=0, controls={}, adapter={}, points={}, generators={}, pumpkins={}, blacklist={}, heldKeys={},clickLeases={},
     status={action="Disabled", target="None", result="No confirmed result yet", waiting="None"},
     metrics={skillInputs=0, parryRequests=0, parrySuccess=0, repairGain=0, pumpkinAttempts=0, pumpkinsConfirmed=0, recoveryStarts=0,equipmentWrites=0},
@@ -739,6 +739,7 @@ end
 function A:Travel(position,owner)
     if owner~="pumpkin" then self:ClearFailure("navigation") end
     self:CancelMove(); stopRepair()
+    if Motion and Motion:ShouldYield() then self.status.waiting="Movement stabilization: "..Motion.reason; return false end
     local state,ch,h,root=Adapter.State()
     local allowed,why=Rules.canWalk(state)
     if not allowed then self.status.waiting=why; return false end
@@ -764,6 +765,7 @@ end
 local function travelStep()
     local move=A.move
     if not move then return end
+    if Motion and Motion:ShouldYield() then A:CancelMove("Movement stabilization: "..Motion.reason); return end
     local state,ch,_,root=Adapter.State()
     local allowed,why=Rules.canWalk(state)
     if not allowed or ch~=move.character or root.Anchored then A:CancelMove(why or "Native movement is locked"); return end
@@ -1533,10 +1535,15 @@ function Force:VaultStep(movement,multiplier,killer)
     if math.abs(current-speed)>.001 then track:AdjustSpeed(speed) end
     row.last=speed
 end
-local function forceTargetSpeed()
+local function forceTargetSpeed(native)
     local speed=tonumber(C.forcedSpeed)
     if not speed or speed~=speed or math.abs(speed)==math.huge then speed=40 end
-    return math.max(speed,1)
+    speed=math.max(speed,1)
+    if Motion and C.antiRubber then
+        native=finiteNumber(native,0)
+        return native+(speed-native)*Motion.factor
+    end
+    return speed
 end
 local function forceAttribute(group,object,key,value,allowMissing)
     local current=object:GetAttribute(key)
@@ -1620,6 +1627,9 @@ function Force:Step()
     if not ch then self:Stop(); return end
     if self.character and self.character~=ch then self:Stop() end
     self.character=ch
+    -- Every local movement override shares the same yield decision, including
+    -- direct WalkSpeed, debuff removal and patches called by native controllers.
+    if Motion and Motion:ShouldYield() then self:Stop(); return end
     local movement=A.adapter.movement
     if movement and movement.character~=ch then movement=nil end
     if self.movement and self.movement~=movement then
@@ -1641,7 +1651,9 @@ function Force:Step()
     local crouchFloor=math.max(targets.crouch or 1,C.forceBonuses and bonusTarget("bonusCrouch",2) or 1)
     if Motion and C.antiRubber then
         speedFloor=Motion:Multiplier(speedFloor)
-        if os.clock()<Motion.pauseUntil then bonuses=false end
+        walkFloor=Motion:Multiplier(walkFloor)
+        vaultFloor=Motion:Multiplier(vaultFloor)
+        crouchFloor=Motion:Multiplier(crouchFloor)
     end
     A:RunFeature("perkBonuses",A:ForceKeys(true),function()
     self:VaultStep(movement,bonuses and vaultFloor or 1,killer)
@@ -1668,6 +1680,10 @@ function Force:Step()
                 if type(base)~="number" or base~=base or math.abs(base)==math.huge then base=10 end
                 local activeTargets=PerkBoosts and PerkBoosts:Targets() or {}
                 local floor=math.max(base,0)*math.max(activeTargets.walk or 1,C.forceBonuses and bonusTarget("bonusWalk",1.2) or 1)
+                if Motion and C.antiRubber then
+                    if Motion:ShouldYield() then return value end
+                    floor=math.max(base,0)*Motion:Multiplier(math.max(activeTargets.walk or 1,C.forceBonuses and bonusTarget("bonusWalk",1.2) or 1))
+                end
                 if type(value)~="number" or value~=value or math.abs(value)==math.huge then return floor end
                 return math.max(value,floor)
             end)
@@ -1675,7 +1691,7 @@ function Force:Step()
     else self:Release("forceBonuses") end
     end,function() self:Release("forceBonuses") end)
     A:RunFeature("forceMovement",{"forceMovement"},function()
-    if C.forceMovement and not nativeBusy and not (C.antiRubber and (observedAttribute(ch,"IsHooked") or observedAttribute(ch,"IsCarried") or ch:GetAttribute("AC_ServerAnchor"))) then
+    if C.forceMovement and not nativeBusy and not (Motion and C.antiRubber and Motion.factor<.99) then
         for _,name in {"Rooted","Immobile","MovementLocked","IsStunned","Trapped","Chained","IsHooked","IsCarried","IsBeingHealed","Ragdolled","Knocked"} do
             forceAttribute("forceMovement",ch,name,false)
         end
@@ -1692,7 +1708,7 @@ function Force:Step()
     else self:Release("forceMovement") end
     end,function() self:Release("forceMovement") end)
     A:RunFeature("forceSlow",{"forceSlow"},function()
-    if C.forceSlow then
+    if C.forceSlow and not (Motion and C.antiRubber and Motion.factor<.99) then
         local boost=ch:GetAttribute("speedboost")
         if type(boost)=="number" and boost<1 then forceAttribute("forceSlow",ch,"speedboost",1) end
         if movement then
@@ -1726,19 +1742,25 @@ function Force:Step()
     end,function() self:Release("forceSlow") end)
     A:RunFeature("forceSpeed",{"forceSpeed"},function()
     if C.forceSpeed and not nativeBusy then
-        local speed=forceTargetSpeed()
+        local native=h.WalkSpeed
+        local owned=A.changes.forceSpeed
+        local row=owned and owned.index[h] and owned.index[h].WalkSpeed
+        if row and native==row.last then native=row.original end
+        local speed=forceTargetSpeed(native)
         own("forceSpeed",h,"WalkSpeed",speed)
         if movement then
             local originalSmooth=movement._setWalkSpeedSmooth
             local originalInstant=movement._setWalkSpeedInstant
             if not self.patches["forceSpeed:smooth"] and type(originalSmooth)=="function" then
                 forceMethod("forceSpeed:smooth",movement,"_setWalkSpeedSmooth",function(self,value,...)
-                    return originalSmooth(self,C.forceSpeed and forceTargetSpeed() or value,...)
+                    local active=C.forceSpeed and not (Motion and Motion:ShouldYield())
+                    return originalSmooth(self,active and forceTargetSpeed(value) or value,...)
                 end)
             end
             if not self.patches["forceSpeed:instant"] and type(originalInstant)=="function" then
                 forceMethod("forceSpeed:instant",movement,"_setWalkSpeedInstant",function(self,value,...)
-                    return originalInstant(self,C.forceSpeed and forceTargetSpeed() or value,...)
+                    local active=C.forceSpeed and not (Motion and Motion:ShouldYield())
+                    return originalInstant(self,active and forceTargetSpeed(value) or value,...)
                 end)
             end
         end
@@ -1750,38 +1772,141 @@ A.force=Force
 -- FORCE_CONTROLLER_END
 
 -- EXTRA_CONTROLLERS_BEGIN
-Motion={factor=1,pauseUntil=0,corrections=0}
-function Motion:Stop() self.factor=1; self.pauseUntil=0; self.previous=nil end
+-- MOTION_CONTROLLER_BEGIN
+-- Observe position; never replay a rejected CFrame, suppress replication or
+-- change network ownership. Residuals are evidence of discontinuity, not proof
+-- that a server anti-cheat caused it.
+Motion={factor=1,pauseUntil=0,corrections=0,history={},state="Disabled",reason="Disabled"}
+function Motion:Stop()
+ self.factor=1; self.pauseUntil=0; self.previous=nil; self.character=nil; self.root=nil
+ self.lastCorrection=nil; self.windowStart=nil; self.windowCount=0; self.limitedUntil=0
+ self.blockReason=nil; self.resumeUntil=0; self.netGeneration=nil
+ self.state="Disabled"; self.reason="Disabled"; table.clear(self.history)
+end
+function Motion:ShouldYield()
+ return C.antiRubber and (self.blockReason~=nil or os.clock()<self.pauseUntil or self.factor<=0)
+end
+function Motion:Multiplier(value)
+ return 1+(value-1)*(C.antiRubber and self.factor or 1)
+end
 function Motion:Sample(position,velocity,now,blocked)
- local old=self.previous
- if blocked then self.previous=nil; return false end
- self.previous={position=position,velocity=velocity,time=now}
- if not old then return false end
- local dt=now-old.time
- if dt<=0 or dt>.25 then return false end
- local residual=(position-old.position-old.velocity*dt).Magnitude
- if residual>math.max(6,old.velocity.Magnitude*dt*2+3) then
-  self.corrections=self.corrections+1; self.factor=math.max(.1,self.factor*.7)
-  self.pauseUntil=now+.8; self.lastCorrection=now
-  return true
+ local function valid(n) return type(n)=="number" and n==n and math.abs(n)<1e8 end
+ if not position or not velocity or not valid(now) or not valid(position.X) or not valid(position.Y)
+  or not valid(position.Z) or not valid(velocity.X) or not valid(velocity.Y) or not valid(velocity.Z) then
+  self.previous=nil; table.clear(self.history); self.reason="Invalid motion sample"
+  self.pauseUntil=math.max(self.pauseUntil,os.clock()+.35); return false
  end
- if now-(self.lastCorrection or now)>8 then self.factor=math.min(1,self.factor+dt*.015) end
- return false
+ if blocked then self.previous=nil; table.clear(self.history); return false end
+ local old=self.previous
+ -- Horizontal evidence avoids treating gravity, jumps and landing as rollbacks.
+ local p=Vector3.new(position.X,0,position.Z)
+ local v=Vector3.new(velocity.X,0,velocity.Z)
+ local sample={position=p,velocity=v,time=now}
+ self.previous=sample
+ if not old then table.clear(self.history); table.insert(self.history,sample); return false end
+ local dt=now-old.time
+ if dt<=0 or dt>.25 then
+  table.clear(self.history); table.insert(self.history,sample)
+  self.pauseUntil=math.max(self.pauseUntil,now+.35); self.reason="Resampling after a frame gap"; return false
+ end
+ local delta=p-old.position
+ local expected=(old.velocity+v)*(.5*dt)
+ local residual=(delta-expected).Magnitude
+ local speed=math.max(old.velocity.Magnitude,v.Magnitude)
+ local discontinuity=residual>math.max(6,speed*dt*2+3)
+ local backward=old.velocity.Magnitude>2 and delta.Magnitude>1.25
+  and delta:Dot(old.velocity)<-delta.Magnitude*old.velocity.Magnitude*.4
+ -- A real turn normally changes both displacement and velocity. A snap back
+ -- often retains the old forward velocity or returns to a recent pose.
+ local rollback=backward and v:Dot(old.velocity)>=0 and residual>math.max(1.75,speed*dt*.6+.75)
+ if backward and not rollback then
+  for _,row in self.history do
+   if now-row.time<=.65 and now-row.time>=.06 and (p-row.position).Magnitude<.65
+    and (old.position-row.position).Magnitude>2.5 and residual>2.5 then rollback=true; break end
+  end
+ end
+ local corrected=(discontinuity or rollback) and (not self.lastCorrection or now-self.lastCorrection>=.25)
+ if corrected then
+  if not self.windowStart or now-self.windowStart>8 then self.windowStart=now; self.windowCount=0 end
+  self.windowCount=self.windowCount+1; self.corrections=self.corrections+1
+  self.factor=self.factor*.7; self.pauseUntil=now+math.min(4,.8*2^(self.windowCount-1))
+  self.lastCorrection=now; self.state="Settling"; self.reason="Position discontinuity"
+  if self.windowCount>=3 then
+   self.factor=0; self.limitedUntil=now+15; self.pauseUntil=self.limitedUntil
+   self.state="Limited"; self.reason="Repeated corrections; native movement only"
+  end
+  table.clear(self.history)
+ elseif now>=self.pauseUntil and now-(self.lastCorrection or now)>8 then
+  self.factor=math.min(1,self.factor+dt*.015)
+ end
+ table.insert(self.history,sample)
+ if #self.history>24 then table.remove(self.history,1) end
+ return corrected
+end
+function Motion:ObservedProperty(object,key)
+ local value=object[key]
+ local list=A.changes.forceMovement
+ local row=list and list.index[object] and list.index[object][key]
+ if row and value==row.last then return row.original end
+ return value
+end
+function Motion:NativeReason(ch,h,root)
+ if self:ObservedProperty(root,"Anchored") then return "Anchored by native controller" end
+ if h.Sit or self:ObservedProperty(h,"PlatformStand") then return "Seated or physics-controlled" end
+ for _,key in {"AC_ServerAnchor","IsHooked","IsCarried","IsCarrying","Knocked","Ragdolled",
+  "Rooted","Immobile","MovementLocked","IsStunned","Trapped","Chained","ChainReeling","donttrack","BypassNoclipAntiCheat"} do
+  if observedAttribute(ch,key)==true then return key end
+ end
+ local m=A.adapter.movement
+ if m and m.character==ch and (m.isVaulting or m.isSlideingPallet or m.isHealingActive) then return "Native traversal or healing" end
+ local k=A.adapter.killer
+ local s=k and k.character==ch and k.state
+ if s and (s.isVaulting or s.isStunned or s.isBreaking) then return "Native killer action" end
+ local ctx=A.adapter.repair
+ if A.repair or A.recovery or A.bindHeal or (ctx and ctx.character==ch and ctx.state.activeMouseAction) then return "Native interaction" end
+ local now=workspace:GetServerTimeNow()
+ for _,key in {"ChainYankUntil","NetPalletApproachUntil","HiddenDashReplicationUntil","HiddenLeapReplicationUntil"} do
+  local untilTime=observedAttribute(ch,key)
+  if type(untilTime)=="number" and untilTime==untilTime and untilTime>now and untilTime<now+6 then return "Native traversal window" end
+ end
 end
 function Motion:Step()
- if not C.antiRubber then self:Stop(); return end
- local ch,_,root=character(); if not ch then self:Stop(); return end
- if self.character~=ch then self:Stop(); self.character=ch end
- local movement=A.adapter.movement
- local blocked=root.Anchored or observedAttribute(ch,"IsHooked") or observedAttribute(ch,"IsCarried")
-  or observedAttribute(ch,"Knocked") or (movement and (movement.isVaulting or movement.isSlideingPallet))
- if self:Sample(root.Position,root.AssemblyLinearVelocity,os.clock(),blocked) then
-  if A.move then A:CancelMove("Movement correction detected; waiting for position to settle") end
-  A.status.result="Movement correction observed; boost reduced to "..string.format("%.0f%%",self.factor*100)
+ if not C.antiRubber then if self.state~="Disabled" then self:Stop() end; return end
+ local ch,h,root=character()
+ if not ch then self:Stop(); self.state="Waiting"; self.reason="Waiting for character"; self.blockReason=self.reason; return end
+ local now=os.clock()
+ local generation=observedAttribute(ch,"NetGeneration")
+ if self.character~=ch or self.root~=root or self.netGeneration~=generation then
+  self:Stop(); self.character=ch; self.root=root; self.netGeneration=generation
+  self.pauseUntil=now+.35; self.resumeUntil=self.pauseUntil
  end
+ local why=self:NativeReason(ch,h,root)
+ if why then
+  self.blockReason=why; self.state="Yielding"; self.reason=why; self.resumeUntil=now+.35
+  self:Sample(root.Position,root.AssemblyLinearVelocity,now,true)
+  if A.move then A:CancelMove("Movement stabilization: "..why) end
+  return
+ end
+ self.blockReason=nil
+ if now<self.resumeUntil then
+  self.pauseUntil=math.max(self.pauseUntil,self.resumeUntil)
+  self.state="Settling"; self.reason="Native movement handoff"
+  self:Sample(root.Position,root.AssemblyLinearVelocity,now,true); return
+ end
+ if self:Sample(root.Position,root.AssemblyLinearVelocity,now,false) then
+  if A.move then A:CancelMove("Movement correction detected; waiting for position to settle") end
+  A.status.result="Position discontinuity observed; local boost strength "..string.format("%.0f%%",self.factor*100)
+ elseif now<self.pauseUntil then
+  self.state=self.factor<=0 and "Limited" or "Settling"
+ elseif self.factor<1 then self.state="Recovering"; self.reason="Gradual boost recovery"
+ else self.state="Monitoring"; self.reason="Motion stable" end
 end
-function Motion:Multiplier(value) return 1+(value-1)*(C.antiRubber and self.factor or 1) end
+function Motion:Snapshot()
+ return {state=self.state,reason=self.reason,factor=self.factor,corrections=self.corrections,
+  cooldown=math.max(0,self.pauseUntil-os.clock()),recentCorrections=self.windowCount or 0}
+end
 A.motion=Motion
+-- MOTION_CONTROLLER_END
 
 CameraControl={}
 function CameraControl:Stop()
@@ -2117,7 +2242,11 @@ function A:Set(key,value)
     if key=="noItemCooldowns" and not value then Items:StopCooldowns() end
     if key=="infiniteItems" and not value then Items:StopReserves() end
     if key=="freeCamera" and not value then CameraControl:Stop() end
-    if key=="antiRubber" and not value then Motion:Stop() end
+    if key=="antiRubber" then
+        Motion:Stop()
+        if value then self:RunFeature("antiRubber",{"antiRubber"},function() Motion:Step() end,function() Motion:Stop() end) end
+        self:RunFeature("forceContext",self:ForceKeys(),function() Force:Step() end,function() Force:Stop() end)
+    end
     if key=="instantFlick" and not value then restore("flick") end
     if key=="selfHeal" and not value then SelfHeal:Stop() end
     if key=="autoRepair" and not value then stopRepair() end
@@ -2194,7 +2323,7 @@ function A:Snapshot()
         recovering=self.recovery~=nil,pumpkinPending=self.pumpkinAttempt~=nil,lastError=self.lastError,
         interactionHeld=self.interactionLease~=nil,clicksPending=next(self.clickLeases)~=nil,localForceActive=Force:Active(),
         role=playerRole(LocalPlayer),perkTargets=perkSummary,cursorUnlocked=Cursor.original~=nil,
-        failures=self.failures,selfHealActive=self.bindHeal~=nil,corrections=Motion.corrections,speedBoost=C.speedBoost}
+        failures=self.failures,selfHealActive=self.bindHeal~=nil,corrections=Motion.corrections,speedBoost=C.speedBoost,motion=Motion:Snapshot()}
 end
 
 
@@ -2293,7 +2422,9 @@ local ok,err=xpcall(function()
         if A.ready and A.alive then A:Set("speedBoost",value) end
     end,.05)
     toggle(section,"instantFlick","Instant turn & aim")
-    toggle(section,"antiRubber","Adaptive movement stabilization")
+    toggle(section,"antiRubber","Anti-rubberband stabilization")
+    section:Label("Adapts all local movement overrides and yields to native locks. Server corrections may still occur.")
+    A.motionLabel=section:Label("Stabilization: Disabled")
     A.movementLabel=section:Label("Speed x1.00")
     section=group("Camera")
     toggle(section,"freeCamera","Free camera rotation")
@@ -2641,6 +2772,10 @@ local ok,err=xpcall(function()
             else
                 A.movementLabel:SetText(string.format("Speed x%.2f | Waiting for character",C.speedBoost))
             end
+            local motion=Motion:Snapshot()
+            A.motionLabel:SetText(string.format("Stabilization: %s | Boost strength %.0f%% | Corrections %d\n%s%s",
+                motion.state,motion.factor*100,motion.corrections,motion.reason,
+                motion.cooldown>0 and string.format(" (%.1fs)",motion.cooldown) or ""))
             local boost=LocalPlayer:GetAttribute("XPBoostRemaining")
             A.boostLabel:SetText(type(boost)=="number" and boost>0 and
                 string.format("XP boost: %dm %02ds",math.floor(boost/60),math.floor(boost%60)) or "XP boost: inactive")
